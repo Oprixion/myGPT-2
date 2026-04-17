@@ -4,7 +4,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 import math
 
-## A simple implementation of Multihead Attention
+## A simple implementation of Multihead Attention (Previous version (GPT)) 
+# - For architecture understanding purpose, not used in the final GPT implementation in this repo. 
+#   See CausalSelfAttention for the optimized version.
+
 #class Head(nn.Module):
 #    
 #    def __init__(self, head_size):
@@ -61,7 +64,7 @@ class CausalSelfAttention(nn.Module):
         self.n_embed = config.n_embed
 
         # Triangular masking for auto-regressive decoding
-        self.register_buffer("bias", torch.tril(torch.ones(config.context_window, config.context_window))).view(1, 1, config.context_window, config.context_window)
+        self.register_buffer("bias", torch.tril(torch.ones(config.context_window, config.context_window)).view(1, 1, config.context_window, config.context_window))
 
     def forward(self, x):
         B, T, C = x.size() # B: batch size, T: sequence length, C: embedding dimensionality (n_embed)
@@ -106,24 +109,24 @@ class MLP(nn.Module):
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
-        self.ln1 = nn.LayerNorm(config.n_embed)
-        self.mha = CausalSelfAttention(config)
+        self.ln_1 = nn.LayerNorm(config.n_embed)
+        self.attn = CausalSelfAttention(config)
 
-        self.ln2 = nn.LayerNorm(config.n_embed)
+        self.ln_2 = nn.LayerNorm(config.n_embed)
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.mha(self.ln1(x)) # Residual connection, adds the weighted sum of attention back to the input. (Pre-LN)
-        x = x + self.mlp(self.ln2(x)) # Residual connection, adds the output of the FFW MLP back to the input. (Pre-LN)
+        x = x + self.attn(self.ln_1(x)) # Residual connection, adds the weighted sum of attention back to the input. (Pre-LN)
+        x = x + self.mlp(self.ln_2(x)) # Residual connection, adds the output of the FFW MLP back to the input. (Pre-LN)
         return x
 
 @dataclass
 class GPTConfig:
     context_window: int = 1024 # Block_size
-    vocab_size: int = 65
-    n_layers: int = 6
-    n_head: int = 6
-    n_embed: int = 384
+    vocab_size: int = 50257
+    n_layers: int = 12
+    n_head: int = 12
+    n_embed: int = 768
     dropout: float = 0.2
 
 class GPT(nn.Module):
@@ -140,3 +143,117 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False) # Language modeling head (final output layer)
 
+    def forward(self, idx):
+        B, T = idx.size()
+        assert T <= self.config.context_window, "Cannot forward, model context window is exhausted."
+
+        # forward the tokens and postions through the GPT model
+        token_embeddings = self.transformer.wte(idx) # (B,T,n_embed)
+        position_embeddings = self.transformer.wpe(torch.arange(0,T,dtype=torch.long,device=idx.device)) # (T,n_embed)
+        x = token_embeddings + position_embeddings # (B,T,n_embed)
+        
+        #x = self.transformer.drop(x)
+
+        # Forward the transformer blocks
+        for block in self.transformer.h:
+            x = block(x) # (B,T,n_embed)
+        # Final layer norm
+        x = self.transformer.ln_f(x) # (B,T,n_embed)
+        logits = self.lm_head(x) # (B,T,vocab_size)
+        return logits
+
+    # Loads pre-trained weights from GPT-2 model (from HuggingFace) into our GPT implementation.
+    @classmethod
+    def from_pretrained(cls, model_type):
+        # Get the weights from HuggingFace
+        assert model_type in {'gpt2', 'gpt2-medium', 'gpt2-large', 'gpt2-xl'}
+        from transformers import GPT2LMHeadModel
+        print("Loading pretrained weights from HF for model: %s" % model_type)
+
+        # Loads the hyperparameters and weights from HuggingFace GPT-2 model
+        config_args = {
+            'gpt2': dict(n_layers=12, n_head=12, n_embed=768), # GPT-2 small (124M parameters)
+            'gpt2-medium': dict(n_layers=24, n_head=16, n_embed=1024), # GPT-2 medium (355M parameters)
+            'gpt2-large': dict(n_layers=36, n_head=20, n_embed=1280), # GPT-2 large (774M parameters)
+            'gpt2-xl': dict(n_layers=48, n_head=25, n_embed=1600), # GPT-2 xl (1558M parameters)
+        }[model_type]
+        config_args['context_window'] = 1024
+        config_args['vocab_size'] = 50257
+
+        # Initialize our GPT model with the same hyperparameters as the HuggingFace GPT-2 model
+        # Get state dict from HuggingFace GPT-2 model and load it into our GPT model
+        config = GPTConfig(**config_args)
+        model = GPT(config)
+        # State dict from our GPT model
+        sd = model.state_dict()
+        sd_keys = sd.keys()
+        sd_keys = [k for k in sd_keys if not k.endswith('.attn.bias')] # Remove the attention bias buffer (triangular mask) since it's not a parameter
+
+        # State dict from HuggingFace GPT-2 model
+        model_hf = GPT2LMHeadModel.from_pretrained(model_type)
+        sd_hf = model_hf.state_dict()
+
+        # Load the weights from HuggingFace GPT-2 model into our GPT model
+        sd_keys_hf = sd_hf.keys()
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.masked_bias')] # Remove the attention bias buffer (triangular mask) since it's not a parameter
+        sd_keys_hf = [k for k in sd_keys_hf if not k.endswith('.attn.bias')] # Remove the attention bias buffer (triangular mask) since it's not a parameter
+
+        # These Hugginface's GPT-2 Weights are transposed for TensorFlow, we need to transpose them back for PyTorch
+        transposed = ['attn.c_attn.weight', 'attn.c_proj.weight', 'mlp.c_fc.weight', 'mlp.c_proj.weight'] 
+
+        assert len(sd_keys) == len(sd_keys_hf), f"Number of parameters in our GPT model and HuggingFace GPT-2 model do not match:{len(sd_keys)} vs {len(sd_keys_hf)}"
+        for k in sd_keys_hf:
+            if any(k.endswith(w) for w in transposed):
+                # Check if the shapes are compatible for transposition
+                assert sd_hf[k].shape[::-1] == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k].T) # Transpose the weights back for PyTorch
+            else:
+                assert sd_hf[k].shape == sd[k].shape
+                with torch.no_grad():
+                    sd[k].copy_(sd_hf[k]) # Copy the weights directly
+        return model
+    
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+model = GPT.from_pretrained('gpt2')
+print("Model loaded with pretrained weights from HuggingFace GPT-2 small (124M parameters).")
+
+num_return_sequences = 5
+max_length = 30
+model.eval() # Set the model to evaluation mode (disables dropout)
+model.to(device) # Move the model to GPU if available, otherwise keep it on CPU
+
+# Tokenize the input prompt and convert it to a tensor
+import tiktoken
+enc = tiktoken.get_encoding("gpt2")
+tokens = enc.encode("Hello, I'm a language model,")
+tokens = torch.tensor(tokens, dtype=torch.long) # (T,)
+tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (num_return_sequences, T)
+x = tokens.to(device) # Move the input tokens to the same device as the model
+
+# Generate
+torch.manual_seed(42)
+torch.cuda.manual_seed(42)
+
+while x.size(1) < max_length:
+    # Run the forward pass to get the logits for the next token
+    with torch.no_grad():
+        logits = model(x) # (B = num_return_sequences, T, vocab_size)
+        # Take the last logit
+        logits = logits[:, -1, :] # (B = num_return_sequences, vocab_size)
+        # Get probabilities from the logits
+        probs = F.softmax(logits, dim=-1) # (B = num_return_sequences, vocab_size)
+        # Top-k sampling (HF default: k=50)
+        tok_probs, tok_indices = torch.topk(probs, k=50, dim=-1) # tok_probs (k, B = num_return_sequences), tok_indices (B = num_return_sequences, k)
+        # Sample the next token from the top-k(50) probabilities
+        next_token_idx = torch.multinomial(tok_probs, num_samples=1) # (B = num_return_sequences, 1)
+        next_token = torch.gather(tok_indices, -1, next_token_idx) # (B = num_return_sequences, 1)
+        # Append the predicted token to the input sequence
+        x = torch.cat((x, next_token), dim=1) 
+
+# Display the predicted outputs
+for i in range(num_return_sequences):
+    output_tokens = x[i, :max_length].tolist()
+    output_text = enc.decode(output_tokens)
+    print(f"Output {i+1}: {output_text}")
