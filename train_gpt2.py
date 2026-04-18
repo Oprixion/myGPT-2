@@ -143,7 +143,7 @@ class GPT(nn.Module):
         ))
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False) # Language modeling head (final output layer)
 
-    def forward(self, idx):
+    def forward(self, idx, targets=None):
         B, T = idx.size()
         assert T <= self.config.context_window, "Cannot forward, model context window is exhausted."
 
@@ -157,10 +157,14 @@ class GPT(nn.Module):
         # Forward the transformer blocks
         for block in self.transformer.h:
             x = block(x) # (B,T,n_embed)
+            
         # Final layer norm
         x = self.transformer.ln_f(x) # (B,T,n_embed)
         logits = self.lm_head(x) # (B,T,vocab_size)
-        return logits
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1)) # (B*T, vocab_size) and (B*T,) for cross-entropy loss
+        return logits, loss
 
     # Loads pre-trained weights from GPT-2 model (from HuggingFace) into our GPT implementation.
     @classmethod
@@ -216,17 +220,55 @@ class GPT(nn.Module):
     
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 
-model = GPT.from_pretrained('gpt2')
-print("Model loaded with pretrained weights from HuggingFace GPT-2 small (124M parameters).")
+# Tokenize the input prompt and convert it to a tensor
+import tiktoken
+enc = tiktoken.get_encoding("gpt2")
+
+# Tiny Shakespeare training input
+import urllib.request
+import os
+if not os.path.exists('input.txt'):
+    urllib.request.urlretrieve(
+        'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt',
+        'input.txt'
+    )
+with open('input.txt', 'r', encoding='utf-8') as f:
+    text = f.read()
+text = text[:10000] # Use only the first 10k characters for testing
+tokens = enc.encode(text)
+B, T = 4, 32 # Batch size and sequence length for testing
+buf = torch.tensor(tokens[:B*T+1])
+buf = buf.to(device) # Move the input tokens to GPU
+x = buf[:-1].view(B, T) # (B,T)
+y = buf[1:].view(B, T) # (B,T)
+
+# Weights initialization from HuggingFace
+#model = GPT.from_pretrained('gpt2')
+#print("Model loaded with pretrained weights from HuggingFace GPT-2 small (124M parameters).")
+
+# Random weights initialization
+model = GPT(GPTConfig())
+print("Model loaded with random initialized weights.")
+model.to(device) # Move the model to GPU if available, otherwise keep it on CPU
+#logits, loss = model(x, y)
+
+# Optimize
+optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
+for i in range (50):
+    optimizer.zero_grad()
+    logits, loss = model(x, y)
+    loss.backward()
+    optimizer.step()
+    print(f"Iteration {i+1}, Loss: {loss.item():.4f}")
+
+
+import sys; sys.exit(0)
 
 num_return_sequences = 5
 max_length = 30
 model.eval() # Set the model to evaluation mode (disables dropout)
-model.to(device) # Move the model to GPU if available, otherwise keep it on CPU
 
-# Tokenize the input prompt and convert it to a tensor
-import tiktoken
-enc = tiktoken.get_encoding("gpt2")
+# Test inputs
 tokens = enc.encode("Hello, I'm a language model,")
 tokens = torch.tensor(tokens, dtype=torch.long) # (T,)
 tokens = tokens.unsqueeze(0).repeat(num_return_sequences, 1) # (num_return_sequences, T)
