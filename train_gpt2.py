@@ -97,6 +97,7 @@ class MLP(nn.Module):
         self.c_fc = nn.Linear(config.n_embed, 4*config.n_embed) # Expand the embedding size to 4 times for the hidden layer in the MLP
         self.gelu = nn.GELU(approximate='tanh') # tanh approximation is used to replicate GPT-2. Just GELU(approximation = 'none') is also fine.
         self.c_proj = nn.Linear(4*config.n_embed, config.n_embed) # Project back to the original embedding size
+        self.c_proj.GPT2_SCALE_INIT = 1
         #self.dropout = nn.Dropout(config.dropout)
 
     def forward(self, x):
@@ -142,6 +143,23 @@ class GPT(nn.Module):
             ln_f = nn.LayerNorm(config.n_embed),
         ))
         self.lm_head = nn.Linear(config.n_embed, config.vocab_size, bias=False) # Language modeling head (final output layer)
+
+        # Weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+
+        # Prameters initialization (same as GPT-2 paper)
+        self.apply(self._init_weights)
+
+    def _init_weights(self, module):
+        if isinstance(module, nn.Linear):
+            std = 0.2
+            if hasattr(module, 'GPT2_SCALE_INIT'):
+                std *= (2 * self.config.n_layers) ** -0.5 # Scale the standard deviation of the weight initialization by the number of layers (for residual connections)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.2)
 
     def forward(self, idx, targets=None):
         B, T = idx.size()
@@ -218,29 +236,51 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k]) # Copy the weights directly
         return model
     
-device = 'cuda' if torch.cuda.is_available() else 'cpu'
-
-# Tokenize the input prompt and convert it to a tensor
+# -----------------------------------------------------
+# Dataloader
 import tiktoken
-enc = tiktoken.get_encoding("gpt2")
 
-# Tiny Shakespeare training input
-import urllib.request
-import os
-if not os.path.exists('input.txt'):
-    urllib.request.urlretrieve(
-        'https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt',
-        'input.txt'
-    )
-with open('input.txt', 'r', encoding='utf-8') as f:
-    text = f.read()
-text = text[:10000] # Use only the first 10k characters for testing
-tokens = enc.encode(text)
-B, T = 4, 32 # Batch size and sequence length for testing
-buf = torch.tensor(tokens[:B*T+1])
-buf = buf.to(device) # Move the input tokens to GPU
-x = buf[:-1].view(B, T) # (B,T)
-y = buf[1:].view(B, T) # (B,T)
+class DataLoaderLite:
+    def __init__(self, B, T):
+        self.B = B
+        self.T = T
+
+        # Load the text data from the input file
+        with open('input.txt', 'r', encoding='utf-8') as f:
+            text = f.read()
+
+        # Encoding the text using tiktoken (GPT-2's tokenizer)    
+        enc = tiktoken.get_encoding("gpt2")
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens, dtype=torch.long)
+        print(f"Data loaded from input.txt, total tokens: {len(self.tokens)}")
+        print(f"1 Epoch has {len(self.tokens) // (B*T)} batches of size {B} and sequence length {T}.")
+
+        # State
+        self.current_position = 0
+
+    def next_batch(self):
+        B,T = self.B, self.T
+        buf = self.tokens[self.current_position:self.current_position+B*T+1]
+        x = buf[:-1].view(B, T) # Inputs
+        y = buf[1:].view(B, T) # Targets (next token)
+        # Updates position to the next batch
+        self.current_position += B*T
+        # Resets to the beginning of the data if batchs run out
+        if self.current_position + B*T + 1 >= len(self.tokens):
+            self.current_position = 0
+        return x, y
+# -----------------------------------------------------
+
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+print(f"Using device: {device}")
+
+# Set seed for reproducibility
+torch.manual_seed(42)
+if device == 'cuda':
+    torch.cuda.manual_seed(42)
+
+train_loader = DataLoaderLite(B=4, T=32) # B: batch size, T: sequence length (context window)
 
 # Weights initialization from HuggingFace
 #model = GPT.from_pretrained('gpt2')
@@ -248,18 +288,22 @@ y = buf[1:].view(B, T) # (B,T)
 
 # Random weights initialization
 model = GPT(GPTConfig())
-print("Model loaded with random initialized weights.")
 model.to(device) # Move the model to GPU if available, otherwise keep it on CPU
+print(f"Model loaded with random initialized weights on {device}.")
 #logits, loss = model(x, y)
 
 # Optimize
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range (50):
+    # Get the next batch of data
+    x, y = train_loader.next_batch()
+    x, y = x.to(device), y.to(device) # Move the batch to the same device as the model
+    # Forward pass, compute loss, backward pass, and update weights
     optimizer.zero_grad()
     logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"Iteration {i+1}, Loss: {loss.item():.4f}")
+    print(f"Iteration {i}, Loss: {loss.item()}")
 
 
 import sys; sys.exit(0)
