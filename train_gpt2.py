@@ -58,6 +58,7 @@ class CausalSelfAttention(nn.Module):
         self.c_attn = nn.Linear(config.n_embed, 3 * config.n_embed)
         # output projection
         self.c_proj = nn.Linear(config.n_embed, config.n_embed)
+        self.c_proj.GPT2_SCALE_INIT = 1
         #self.dropout = nn.Dropout(config.dropout)
         # Regularization
         self.n_head = config.n_head
@@ -152,14 +153,14 @@ class GPT(nn.Module):
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
-            std = 0.2
+            std = 0.02
             if hasattr(module, 'GPT2_SCALE_INIT'):
                 std *= (2 * self.config.n_layers) ** -0.5 # Scale the standard deviation of the weight initialization by the number of layers (for residual connections)
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias)
         elif isinstance(module, nn.Embedding):
-            torch.nn.init.normal_(module.weight, mean=0.0, std=0.2)
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
     def forward(self, idx, targets=None):
         B, T = idx.size()
@@ -271,6 +272,7 @@ class DataLoaderLite:
             self.current_position = 0
         return x, y
 # -----------------------------------------------------
+import time
 
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
 print(f"Using device: {device}")
@@ -280,7 +282,9 @@ torch.manual_seed(42)
 if device == 'cuda':
     torch.cuda.manual_seed(42)
 
-train_loader = DataLoaderLite(B=4, T=32) # B: batch size, T: sequence length (context window)
+train_loader = DataLoaderLite(B=8, T=1024) # B: batch size, T: sequence length (context window)
+
+torch.set_float32_matmul_precision('high') # Enable TF32
 
 # Weights initialization from HuggingFace
 #model = GPT.from_pretrained('gpt2')
@@ -295,16 +299,23 @@ print(f"Model loaded with random initialized weights on {device}.")
 # Optimize
 optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
 for i in range (50):
+    t0 = time.time() 
+    # Time start =======================
     # Get the next batch of data
     x, y = train_loader.next_batch()
     x, y = x.to(device), y.to(device) # Move the batch to the same device as the model
     # Forward pass, compute loss, backward pass, and update weights
     optimizer.zero_grad()
-    logits, loss = model(x, y)
+    with torch.autocast(device_type=device, dtype=torch.bfloat16): # Enable mixed precision
+        logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
-    print(f"Iteration {i}, Loss: {loss.item()}")
-
+    # Time end =======================
+    torch.cuda.synchronize() # Wait for the GPU to finish before measuring time
+    t1 = time.time() 
+    dt = (t1 - t0)*1000
+    tps = (train_loader.B * train_loader.T) / (dt/1000)
+    print(f"Batch {i}, Loss: {loss.item()}, DeltaTime: {dt:.4f} ms, Tokens/sec: {tps:.2f}")
 
 import sys; sys.exit(0)
 
