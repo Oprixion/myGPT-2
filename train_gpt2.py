@@ -282,7 +282,7 @@ torch.manual_seed(42)
 if device == 'cuda':
     torch.cuda.manual_seed(42)
 
-train_loader = DataLoaderLite(B=8, T=1024) # B: batch size, T: sequence length (context window)
+train_loader = DataLoaderLite(B=16, T=1024) # B: batch size, T: sequence length (context window)
 
 torch.set_float32_matmul_precision('high') # Enable TF32
 
@@ -293,6 +293,8 @@ torch.set_float32_matmul_precision('high') # Enable TF32
 # Random weights initialization
 model = GPT(GPTConfig())
 model.to(device) # Move the model to GPU if available, otherwise keep it on CPU
+model = torch.compile(model) # Compile the model for faster training (PyTorch 2.0+)
+
 print(f"Model loaded with random initialized weights on {device}.")
 #logits, loss = model(x, y)
 
@@ -307,7 +309,7 @@ for i in range (50):
     # Forward pass, compute loss, backward pass, and update weights
     optimizer.zero_grad()
     with torch.autocast(device_type=device, dtype=torch.bfloat16): # Enable mixed precision
-        logits, loss = model(x, y)
+         logits, loss = model(x, y)
     loss.backward()
     optimizer.step()
     # Time end =======================
