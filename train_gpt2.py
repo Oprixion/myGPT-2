@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+import inspect
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -242,6 +243,30 @@ class GPT(nn.Module):
                     sd[k].copy_(sd_hf[k]) # Copy the weights directly
         return model
     
+    def configure_optimizers(self, weight_decay, learning_rate, device):
+        # Optimize candidate parameters (decay and non-decay)
+        param_dict = {pn: p for pn, p in self.named_parameters()}
+        param_dict = {pn: p for pn, p in param_dict.items() if p.requires_grad} # Filter out frozen parameters
+
+        # Optimization groups for weight decay (Decay if the param's dimension is > 1)
+        decay_params = [p for pn, p in param_dict.items() if p.ndim >=2]
+        nodecay_params = [p for pn, p in param_dict.items() if p.ndim < 2]
+        optim_groups = [
+            {'params': decay_params, 'weight_decay': weight_decay},
+            {'params': nodecay_params, 'weight_decay': 0.0}
+        ]
+        # Check prameters count
+        num_decay_params = sum(p.numel() for p in decay_params)
+        num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"Number of decay parameters: {num_decay_params}, number of no-decay parameters: {num_nodecay_params}, total: {num_decay_params + num_nodecay_params}")
+        # Create the optimizer (Using fused AdamW from PyTorch 2.0 for faster optimization)
+        fused_available = 'fused' in inspect.signature(torch.optim.AdamW).parameters
+        use_fused = fused_available and device == 'cuda'
+        print(f"Using fused AdamW: {use_fused}")
+        optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-8, fused=use_fused)
+        return optimizer
+
+    
 # -----------------------------------------------------
 # Dataloader
 import tiktoken
@@ -287,7 +312,15 @@ torch.manual_seed(42)
 if device == 'cuda':
     torch.cuda.manual_seed(42)
 
-train_loader = DataLoaderLite(B=16, T=1024) # B: batch size, T: sequence length (context window)
+# Gradient Accumulation steps (to simulate larger batch size with limited GPU memory)
+total_batch_size = 524288 # 2**19 Tokens per batch
+B = 16 # Batch size (number of sequences in a batch)
+T = 1024 # Sequence length (context window)
+assert total_batch_size % (B * T) == 0, f"Total batch size must be divisible by B * T, but got {total_batch_size} vs {B*T}"
+grad_accum_steps = total_batch_size // (B * T) # Number of gradient accumulation steps needed 
+print(f"Total batch size: {total_batch_size}, Batch size (B): {B}, Sequence length (T): {T}, Gradient accumulation steps: {grad_accum_steps}")
+
+train_loader = DataLoaderLite(B=B, T=T) # B: batch size, T: sequence length (context window)
 
 torch.set_float32_matmul_precision('high') # Enable TF32
 
@@ -296,33 +329,66 @@ torch.set_float32_matmul_precision('high') # Enable TF32
 #print("Model loaded with pretrained weights from HuggingFace GPT-2 small (124M parameters).")
 
 # Random weights initialization
-model = GPT(GPTConfig())
+model = GPT(GPTConfig(vocab_size=50304))
 model.to(device) # Move the model to GPU if available, otherwise keep it on CPU
 model = torch.compile(model) # Compile the model for faster training (PyTorch 2.0+)
 
 print(f"Model loaded with random initialized weights on {device}.")
 #logits, loss = model(x, y)
 
+# Cosine Scheduler
+max_lr = 6e-4
+min_lr = max_lr * 0.1
+warmup_iters = 10
+max_iters = 50
+def get_lr(it):
+    # 1) linear warmup for the first 1000 iterations
+    if it < warmup_iters:
+        return max_lr * (it+1) / warmup_iters
+    # 2) If interations exceed the warmup phase, use min_lr for the rest of the training
+    elif it > max_iters:
+        return min_lr
+    # 3) cosine learning rate decay in between (1) and (2)
+    decay_ratio = (it - warmup_iters) / (max_iters - warmup_iters)
+    assert 0 <= decay_ratio <= 1
+    coeff = 0.5 * (1 + math.cos(math.pi * decay_ratio)) # cosine decay
+    return min_lr + coeff * (max_lr - min_lr)
+
 # Optimize
-optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4)
-for i in range (50):
+# optimizer = torch.optim.AdamW(model.parameters(), lr=3e-4, betas=(0.9, 0.95), eps = 1e-8)
+optimizer = model.configure_optimizers(weight_decay=0.1, learning_rate=max_lr, device=device) # Configure the optimizer with weight decay and learning rate scheduler
+
+for i in range (max_iters):
     t0 = time.time() 
     # Time start =======================
-    # Get the next batch of data
-    x, y = train_loader.next_batch()
-    x, y = x.to(device), y.to(device) # Move the batch to the same device as the model
     # Forward pass, compute loss, backward pass, and update weights
     optimizer.zero_grad()
-    with torch.autocast(device_type=device, dtype=torch.bfloat16): # Enable mixed precision
-         logits, loss = model(x, y)
-    loss.backward()
+    loss_accum = 0.0
+    # Gradient accumulation loop
+    for micro_step in range(grad_accum_steps):
+        # Get the next batch of data
+        x, y = train_loader.next_batch()
+        x, y = x.to(device), y.to(device) # Move the batch to the same device as the model
+        with torch.autocast(device_type=device, dtype=torch.bfloat16): # Enable mixed precision
+            logits, loss = model(x, y)
+        loss = loss / grad_accum_steps # Normalize the loss by the number of gradient accumulation steps
+        loss_accum += loss.detach()
+        loss.backward()
+
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0) # Gradient clipping to prevent exploding gradients
+    # Update the learning rate according to the cosine scheduler
+    lr = get_lr(i)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
     optimizer.step()
     # Time end =======================
     torch.cuda.synchronize() # Wait for the GPU to finish before measuring time
     t1 = time.time() 
     dt = (t1 - t0)*1000
-    tps = (train_loader.B * train_loader.T) / (dt/1000)
-    print(f"Batch {i}, Loss: {loss.item()}, DeltaTime: {dt:.4f} ms, Tokens/sec: {tps:.2f}")
+    ntokens = train_loader.B * train_loader.T * grad_accum_steps
+    tps = ntokens / (dt/1000)
+    print(f"Batch {i}, Loss: {loss_accum.item()}, norm: {norm:.4f}, DeltaTime: {dt:.4f} ms, Tokens/sec: {tps:.2f}")
 
 import sys; sys.exit(0)
 
