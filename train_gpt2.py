@@ -79,12 +79,17 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B,n_head,T,head_size)
 
         # Q @ K^T attention matrix (T, T)
-        att = (q @ k.transpose(-2,-1)) * (1.0 / math.sqrt(k.size(-1))) # (B,n_head,T,T)
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # (B,n_head,T,T)
-        att = F.softmax(att, dim=-1) # (B,n_head,T,T)
-        #att = self.dropout(att)
+        
+        ## Traditional implementation of attention
+        #att = (q @ k.transpose(-2,-1)) * (1.0 / math.sqrt(k.size(-1))) # (B,n_head,T,T)
+        #att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf')) # (B,n_head,T,T)
+        #att = F.softmax(att, dim=-1) # (B,n_head,T,T)
+        ##att = self.dropout(att)
+        #y = att @ v # (B,n_head,T,T) @ (B,n_head,T,head_size) -> (B,n_head,T,head_size)
 
-        y = att @ v # (B,n_head,T,T) @ (B,n_head,T,head_size) -> (B,n_head,T,head_size)
+        # Flash attention implementation
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True) # (B,n_head,T,head_size)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side -> (B,T,C)
         # Output projection
         y = self.c_proj(y) # (B,T,C)
